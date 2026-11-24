@@ -187,10 +187,14 @@ class Ingestor:
             return 0
         table = f"{self.schema}.crm_associations"
         ids_df = self.spark.createDataFrame([(i,) for i in set(ids)], "from_id STRING")
-        ids_df.createOrReplaceTempView(view := f"_assoc_ids_{from_type}_{to_type}_{instance}")
-        self.spark.sql(f"""DELETE FROM {table} WHERE instance = '{instance}' AND from_type = '{from_type}'
-                           AND to_type = '{to_type}' AND from_id IN (SELECT from_id FROM {view})""")
-        self.spark.catalog.dropTempView(view)
+        from delta.tables import DeltaTable
+        # MERGE ... DELETE works on open-source Delta and Databricks (DELETE with IN-subquery is Databricks-only)
+        (DeltaTable.forName(self.spark, table).alias("t")
+         .merge(ids_df.alias("s"),
+                f"t.from_id = s.from_id AND t.instance = '{instance}' "
+                f"AND t.from_type = '{from_type}' AND t.to_type = '{to_type}'")
+         .whenMatchedDelete()
+         .execute())
         if links:
             rows = [(instance, from_type, l["from_id"], to_type, l["to_id"], l["type_id"], l["category"], l["label"])
                     for l in links]
