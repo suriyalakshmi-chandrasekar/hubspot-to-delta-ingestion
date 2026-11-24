@@ -1,0 +1,22 @@
+# Two CRM instances (e.g. two business units), same object list.
+# Tokens are read from environment variables (or a Databricks secret scope);
+# they never live in this file.
+instances:
+  - name: sales
+    token_env: HUBSPOT_TOKEN_SALES
+  - name: partners
+    token_env: HUBSPOT_TOKEN_PARTNERS
+
+objects:
+  - name: companies                 # no properties listed -> discover all of them
+  - name: contacts
+    associations: [companies]
+  - name: deals
+    properties: [dealname, amount, dealstage, closedate, pipeline, hubspot_owner_id]
+    associations: [companies]
+
+target_schema: bronze
+overlap_minutes: 5
+max_workers: 4
+requests_per_second: 8
+chunk_size: 5000

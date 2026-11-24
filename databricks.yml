@@ -1,0 +1,29 @@
+# Databricks Asset Bundle
+#   databricks secrets create-scope crm
+#   databricks secrets put-secret crm HUBSPOT_TOKEN_SALES
+#   databricks bundle deploy -t dev && databricks bundle run crm_to_bronze -t dev
+bundle:
+  name: hubspot-to-delta
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+resources:
+  jobs:
+    crm_to_bronze:
+      name: "[crm] HubSpot to bronze"
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"      # hourly
+        timezone_id: UTC
+        pause_status: PAUSED
+      tasks:
+        - task_key: ingest
+          notebook_task:
+            notebook_path: ./databricks/ingest.py
+            base_parameters: { secret_scope: crm, full_refresh: "false" }
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec: { client: "2", dependencies: [requests, pyyaml] }
