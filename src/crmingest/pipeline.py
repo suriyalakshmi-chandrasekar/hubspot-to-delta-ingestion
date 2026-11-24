@@ -15,7 +15,9 @@ Per (instance, object):
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -68,6 +70,9 @@ class Ingestor:
         self.spark = spark
         self.cfg = config
         self.schema = config.target_schema
+        # API extraction runs in parallel; writes to the same Delta table are serialized
+        # so two instances never race to create or MERGE one table.
+        self._locks: defaultdict[str, threading.Lock] = defaultdict(threading.Lock)
         self.client_factory = client_factory or (
             lambda inst: HubSpotClient(inst.token(), inst.base_url,
                                        requests_per_second=config.requests_per_second))
@@ -102,7 +107,8 @@ class Ingestor:
             max_seen = watermark
             for batch in chunks(records, self.cfg.chunk_size):
                 rows = [flatten(r, inst.name, obj.name) for r in batch]
-                self._merge_records(obj.name, rows)
+                with self._locks[self._table(obj.name)]:
+                    self._merge_records(obj.name, rows)
                 result.upserted += len(rows)
                 changed_ids.extend(r["id"] for r in rows)
                 newest = max(to_epoch_ms(r["updated_at"]) for r in rows if r["updated_at"])
@@ -110,13 +116,17 @@ class Ingestor:
 
             if obj.track_deletes:
                 archived = [flatten(r, inst.name, obj.name) for r in client.list_objects(obj.name, [], archived=True)]
-                result.soft_deleted = self._soft_delete(obj.name, archived)
+                with self._locks[self._table(obj.name)]:
+                    result.soft_deleted = self._soft_delete(obj.name, archived)
 
             for to_type in obj.associations:
-                result.associations += self._refresh_associations(client, inst.name, obj.name, to_type, changed_ids)
+                links = list(client.batch_associations(obj.name, to_type, changed_ids)) if changed_ids else []
+                with self._locks["associations"]:
+                    result.associations += self._refresh_associations(inst.name, obj.name, to_type, changed_ids, links)
 
             if max_seen is not None:
-                self._set_watermark(inst.name, obj.name, max_seen)
+                with self._locks["watermarks"]:
+                    self._set_watermark(inst.name, obj.name, max_seen)
         except Exception as exc:  # recorded per object; other objects keep running
             log.exception("%s/%s failed", inst.name, obj.name)
             result.error = repr(exc)
@@ -170,12 +180,11 @@ class Ingestor:
          .execute())
         return self.spark.table(table).where("archived").count() - before
 
-    def _refresh_associations(self, client: HubSpotClient, instance: str, from_type: str,
-                              to_type: str, ids: list[str]) -> int:
+    def _refresh_associations(self, instance: str, from_type: str, to_type: str,
+                              ids: list[str], links: list[dict]) -> int:
         """Replace associations for the changed records, so removed links disappear too."""
         if not ids:
             return 0
-        links = list(client.batch_associations(from_type, to_type, ids))
         table = f"{self.schema}.crm_associations"
         ids_df = self.spark.createDataFrame([(i,) for i in set(ids)], "from_id STRING")
         ids_df.createOrReplaceTempView(view := f"_assoc_ids_{from_type}_{to_type}_{instance}")
